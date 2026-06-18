@@ -40,9 +40,9 @@ El repositorio aprovecha el ecosistema científico estándar de Python.
 ## Instrucciones de Instalación
 
 Para installar correctamente el repositorio se recomienda seguir estos 3 pasos:
-1. clonar el repositorio: **git clone git@github.com:tiagobasagh/mhwpy.git**
+1. Clonar el repositorio: **git clone git@github.com:tiagobasagh/mhwpy.git**
 2. Ingresar a la carpeta: **cd mhwpy**
-3. installar: **pip install -e .**
+3. Installar: **pip install -e .**
 
 ## Como citar
 
