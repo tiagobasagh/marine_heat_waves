@@ -12,8 +12,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
-        logging.StreamHandler(), # Para ver en consola
-        logging.FileHandler("ejecucion_mhw.log") # Para guardar registro en archivo
+        logging.StreamHandler()
     ]
 )
 
@@ -51,7 +50,7 @@ def get_climatology_and_anomalies(
     Returns
     -------
     xr.Dataset
-        Dataset que contiene 'climatology', 'threshold', 'anomalias', e 'is_event'.
+        Dataset que contiene 'climatology', 'sst_threshold', 'anomalias', e 'posible_mhw_mask'.
         Mantiene las coordenadas y dimensiones originales.
     """
     # Removemos dimensiones menores (depth/profunidad)
@@ -139,9 +138,12 @@ def _anomalies_brief(
     if coldwave:
         max_anom = min(wave_anom)  # Intensidad máxima (pico del evento)
         min_anom = max(wave_anom)  # Anomalía mínima registrada en el período
+        idx_max = np.argmin(wave_anom) # Día en el que se alcanzó el pico
     else:
         max_anom = max(wave_anom)  # Intensidad máxima (pico del evento)
         min_anom = min(wave_anom)  # Anomalía mínima registrada en el período
+        idx_max = np.argmax(wave_anom) # Día en el que se alcanzó el pico
+    
     mean_anom = wave_anom.mean()  # Intensidad media de la ola
     std_anom = wave_anom.std()  # Variabilidad interna de la anomalía
 
@@ -149,7 +151,6 @@ def _anomalies_brief(
     acc_anom = wave_anom.sum()
 
     # Análisis Dinámico (Evolución temporal)
-    idx_max = np.argmax(wave_anom)  # Día en el que se alcanzó el pico
     n_days = wave_anom.shape[0]  # Duración total de la ola en días
 
     # Tasa de crecimiento: velocidad de calentamiento inicial hasta el pico (°C/día)

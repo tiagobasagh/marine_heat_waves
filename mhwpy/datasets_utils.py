@@ -4,7 +4,7 @@ DIR_BASE = os.path.split(os.path.dirname(os.path.realpath(__file__)))[0]
 
 DIR_SST = os.path.join(DIR_BASE, "SST")
 DIR_NOTEBOOKS = os.path.join(DIR_BASE, "notebooks")
-DIR_DATASETS = os.path.join(DIR_NOTEBOOKS,"datasets")
+DIR_DATASETS = os.path.join(DIR_NOTEBOOKS,"datanotebooks")
 
 def save_dataset_as_nc(ds, dir_to_save=None, name_file="example.nc"):
     """
