@@ -1,35 +1,53 @@
+import pandas as pd 
 import numpy as np
-import datetime as dt
+
 from typing import Tuple
 
-def extract_year_from_str_date(date: str)->int:
+def extract_year(date)->int:
     """
     
     """
-    return int(date.split("-")[0])
+    if isinstance(date, pd.Timestamp):
+        return date.year
+    elif isinstance(date, str):
+        return int(date.split("-")[0])
+    else:
+        raise TypeError(f"date es {type(date)} se espera pd.Timestamp/str")
 
 
-def extract_season_from_str_date(date: str) -> str:
+def extract_month(date)->int:
     """
-    Devuelve la estación del año (hemisferio sur) correspondiente a un mes numérico.
+    
+    """
+    if isinstance(date, pd.Timestamp):
+        return date.month
+    elif isinstance(date, str):
+        return int(date.split("-")[1])
+    else:
+        raise TypeError(f"date es {type(date)} se espera pd.Timestamp/str")
+
+
+def extract_season(date, hemisferio="sur" ) -> str:
+    """
+    Devuelve la estación del año dependiendo el hemiferio dada una fecha.
 
     Parameters
     ----------
-    n : int
-        Número del mes (1 a 12).
+    date
 
     Returns
     -------
     str
         Nombre de la estación ('summer', 'autumn', 'winter', 'spring') o 'error'.
     """
-    month = int(date.split("-")[1])
-    if month in (1, 2, 3):
-        return "summer"
-    elif month in (4, 5, 6):
-        return "autumn"
-    elif month in (7, 8, 9):
-        return "winter"
-    elif month in (10, 11, 12):
-        return "spring"
-    return "Mes no valido"
+    month = extract_month(date)
+    if hemisferio.lower()=="sur" or hemisferio.lower()=="south":
+        if month in (1, 2, 3):
+            return "summer"
+        elif month in (4, 5, 6):
+            return "autumn"
+        elif month in (7, 8, 9):
+            return "winter"
+        elif month in (10, 11, 12):
+            return "spring"
+        raise "Error! Mes no valido"

@@ -2,6 +2,23 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from typing import Tuple
+from tqdm import tqdm
+
+import logging
+
+# Configuración básica
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.StreamHandler(), # Para ver en consola
+        logging.FileHandler("ejecucion_mhw.log") # Para guardar registro en archivo
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
 
 
 def get_climatology_and_anomalies(
@@ -9,7 +26,8 @@ def get_climatology_and_anomalies(
     clim_year_init: int = 1991, 
     clim_year_end: int = 2020, 
     window_time: int = 5,
-    percentil: float = .9
+    percentil: float = .9,
+    coldwaves=False,
 ) -> xr.Dataset:
     """
     Calcula la climatología media diaria, el percentil 90 y las anomalías 
@@ -27,46 +45,78 @@ def get_climatology_and_anomalies(
         Ancho de la ventana temporal en días (hacia adelante y hacia atrás). 
         Por defecto 5 (crea una ventana total de 11 días).
     percentil: float, optional
-        Percentil a calcularse. Por defecto es 0.9
-
+        Percentil a calcularse. Por defecto es 0.9,
+    coldwaves: boolean, optional
+        Tipo de ola a calcular. Por defecto, olas de calor
     Returns
     -------
     xr.Dataset
-        Dataset que contiene 'climatology', 'percentil90', 'anomalias', e 'is_sup_p90'.
+        Dataset que contiene 'climatology', 'threshold', 'anomalias', e 'is_event'.
         Mantiene las coordenadas y dimensiones originales.
     """
-    # 1. Construir la ventana móvil SOBRE TODA LA SERIE (para no perder el efecto borde)
+    # Removemos dimensiones menores (depth/profunidad)
+    sst_da = sst_da.squeeze()
+    #  Construir la ventana móvil SOBRE TODA LA SERIE (para no perder el efecto borde)
     window_size = window_time * 2 + 1
-    # Esto asegura que el 1 de enero de 1991 pueda "ver" a diciembre de 1990
+    info_coldwaves = "Olas de Frio" if coldwaves else "Olas de Calor"
+    q_val = (1 - percentil) if coldwaves else percentil
+    
+    info = f""" Parametros del proceso:
+        Climatologia: desde {clim_year_init} a {clim_year_end}
+        Eventos a calcular: {info_coldwaves}
+        Percentil: {q_val}
+        Ventana: {window_size} dias
+    """
+    logger.info(info )
+
+    # Asignando ventana movil para calculo climatologia
     sst_rolled = sst_da.rolling(time=window_size, center=True).construct("window_dim")
     
-    # 2. Recortar el período base climatológico YA con las ventanas construidas
+    # Eliminando valores fuera del periodo de la climatologia esperada
     base_rolled = sst_rolled.sel(time=slice(str(clim_year_init), str(clim_year_end)))
     
-    # 3. Agrupar estrcitamente por mes y día (vital para alinear los bisiestos)
+    # Agrupando por mes-dia
     month_day = base_rolled.time.dt.strftime('%m-%d')
     climatology = base_rolled.groupby(month_day).mean(dim=["time", "window_dim"], skipna=True)
-    percentil90 = base_rolled.groupby(month_day).quantile(percentil, dim=["time", "window_dim"], skipna=True)
     
-    # 4. Calcular anomalías para TODA la serie original (Xarray alinea el dayofyear automáticamente)
+    
+    
+    logger.info(f"Calculando percentil {q_val} de SST. El proceso puede durar algunos minutos.")
+    threshold = base_rolled.groupby(month_day).quantile(
+            q_val, 
+            dim=["time", "window_dim"], 
+            skipna=True
+        ).squeeze(drop=True)
+    # Limpieza des dimensiones auxiales de thrshold antes que se hereden
+    threshold = threshold.drop_vars('quantile', errors='ignore')
+    logger.info(f"Calculando anomalias y posibles mhw")    
     sst_grouped = sst_da.groupby(sst_da.time.dt.strftime('%m-%d'))
-    anomalias = sst_grouped - climatology
-    is_sup_p90 = sst_grouped > percentil90
-    
-    # 5. Limpieza de variables auxiliares que genera groupby
-    anomalias = anomalias.drop_vars("dayofyear", errors="ignore")
-    is_sup_p90 = is_sup_p90.drop_vars("dayofyear", errors="ignore")
-    
-    # Retornamos todo empaquetado prolijamente en un Dataset
-    return xr.Dataset({
+    anomalies = sst_grouped - climatology
+    posible_mhw_mask = sst_grouped < threshold if coldwaves else sst_grouped > threshold
+
+    # Limpieza de variables y dimensiones auxiliares
+    anomalies = anomalies.drop_vars("dayofyear", errors="ignore")
+    posible_mhw_mask = posible_mhw_mask.drop_vars("dayofyear", errors="ignore")
+   
+    logger.info(f"Creando dataset")    
+    ds = xr.Dataset({
         "climatology": climatology,
-        "percentil90": percentil90,
-        "anomalias": anomalias,
-        "is_sup_p90": is_sup_p90
+        "sst_threshold": threshold,
+        "anomalies": anomalies,
+        "posible_mhw_mask": posible_mhw_mask
     })
 
+    ds.attrs["percentil_base"] = q_val
+    ds.attrs["is_coldwaves"] = int(coldwaves)
+    ds.attrs["window_time"] = window_time
+    logger.info(f"Dataset creado")    
+    return ds
 
-def _anomalies_brief(wave_anom: xr.DataArray) -> dict:
+
+def _anomalies_brief(
+        wave_anom: xr.DataArray,
+        coldwave: bool=False
+    ) -> dict:
     """Calcula las métricas de intensidad y tasas dinámicas (crecimiento y
 
     decaimiento) para el ciclo de vida de una Ola de Calor Marina (MHW).
@@ -76,33 +126,38 @@ def _anomalies_brief(wave_anom: xr.DataArray) -> dict:
     wave_anom : np.ndarray o pd.Series
         Vector con las anomalías de temperatura de la superficie del mar (SSTa)
         durante la duración exacta del evento.
+    coldwae: Boolean
+        Booleano que indica si las metricas se calculan para una ola de frio
+        o una olar de calor. Por defecto: False (Ola de calor)
 
     Devuelve
     --------
     dict
         Métricas clave de la MHW (máxima, media, acumulada, tasas, etc.).
     """
-    # 1. Métricas de Intensidad Clásicas
-    max_anom = max(wave_anom)  # Intensidad máxima (pico del evento)
-    min_anom = min(wave_anom)  # Anomalía mínima registrada en el período
+    #  Métricas Clásicas
+    if coldwave:
+        max_anom = min(wave_anom)  # Intensidad máxima (pico del evento)
+        min_anom = max(wave_anom)  # Anomalía mínima registrada en el período
+    else:
+        max_anom = max(wave_anom)  # Intensidad máxima (pico del evento)
+        min_anom = min(wave_anom)  # Anomalía mínima registrada en el período
     mean_anom = wave_anom.mean()  # Intensidad media de la ola
     std_anom = wave_anom.std()  # Variabilidad interna de la anomalía
 
-    # Intensidad acumulada (°C-días): Medida directa del estrés térmico total
+    # Intensidad acumulada (°C-días): Medida del estrés térmico total
     acc_anom = wave_anom.sum()
 
-    # 2. Análisis Dinámico (Evolución temporal)
+    # Análisis Dinámico (Evolución temporal)
     idx_max = np.argmax(wave_anom)  # Día en el que se alcanzó el pico
     n_days = wave_anom.shape[0]  # Duración total de la ola en días
 
     # Tasa de crecimiento: velocidad de calentamiento inicial hasta el pico (°C/día)
-    # Se agrega salvaguarda por si el pico ocurre el día de inicio (evita división por 0)
     growth_anom = (
         (max_anom - wave_anom[0]) / idx_max if idx_max > 0 else np.nan
     )
 
     # Tasa de decaimiento: velocidad de enfriamiento desde el pico hasta el final (°C/día)
-    # Se agrega salvaguarda por si el pico ocurre el último día (evita división por 0)
     days_to_decline = n_days - 1 - idx_max
     decline_anom = (
         (wave_anom[-1] - max_anom) / days_to_decline
@@ -127,6 +182,7 @@ def waves_to_dataframe(
     lat_name: str = "latitude",
     lon_name: str = "longitude",
     time_name: str = "time",
+    coldwaves: bool=False,
 ) -> pd.DataFrame:
     """Transforma la matriz 3D de Olas de Calor Marinas (MHW) en un DataFrame compilado
 
@@ -146,19 +202,21 @@ def waves_to_dataframe(
         Nombre de la dimensión de longitud. Por defecto "longitude".
     time_name : str, opcional
         Nombre de la dimensión de tiempo. Por defecto "time".
-
+    coldwaves: bool, opcional
+        Indica si son olas de calor/frio. Por defecto False(olas de calor)
     Devuelve
     --------
     pd.DataFrame
         Catálogo/Inventario indexado donde cada fila representa un evento único.
     """
-    # 1. Preparación de datos base (conversión a matrices NumPy limpias)
+    logger.info(f"Preparando matrices para crear DataFrame") 
+    # Preparación de datos base 
     data = waves_da.fillna(0).values.astype(np.int8)
-    data = np.squeeze(data)
 
-    # Controlar la existencia de anomalías de forma segura para Xarray
+    # Controlar la existencia de anomalías 
     tiene_anomalias = anomalies is not None
     if tiene_anomalias:
+        logger.info(f"Se agregaran estadisticos de anomalias al inventario")    
         # Se elimina .values dentro del bucle porque 'anom' ya será un array NumPy
         anom = np.squeeze(anomalies.fillna(0).values)
         anom_stats = []
@@ -172,13 +230,14 @@ def waves_to_dataframe(
     # Listas contenedoras para armar el DataFrame estructurado
     lats, lons, t0s, tfs, duration = [], [], [], [], []
 
-    # 2. Bucle espacial anidado (Píxel por píxel)
-    for ilat, lat in enumerate(original_lats):
+    #  Bucle espacial anidado (Píxel por píxel)
+    logger.info(f"Recorriendo pixel por pixel (puede demorar unos instantes)")    
+    for ilat, lat in tqdm(enumerate(original_lats), desc="Latitud"):
         for ilon, lon in enumerate(original_lons):
             serie = data[:, ilat, ilon]
             t = 0
 
-            # 3. Escaneo temporal lineal dentro del píxel activo
+            # Escaneo temporal lineal dentro del píxel activo
             while t < size_time:
                 if serie[t]:  # Si se detecta el inicio de un evento (1)
                     t0 = t
@@ -196,12 +255,14 @@ def waves_to_dataframe(
                     # Extraer métricas estadísticas si se pasaron anomalías
                     if tiene_anomalias:
                         # Extraemos el sub-vector temporal de anomalías para este evento
-                        segmento_anom = anom[t0 : tf + 1, ilat, ilon]
-                        anom_stats.append(_anomalies_brief(segmento_anom))
+                        segmento_anom =  anom[t0 : tf + 1, ilat, ilon]
+                        anom_stats.append(_anomalies_brief(segmento_anom, 
+                                                           coldwave=coldwaves
+                                                           ))
                 else:
                     t += 1
 
-    # 4. Construcción y retorno del DataFrame de salida
+    logger.info(f"Creando DataFrame")    
     if len(lats) == 0:
         # Resguardo si no se detectó ningún evento en toda la grilla
         cols = ["lat", "lon", "t0", "tf", "duration"]
@@ -215,6 +276,7 @@ def waves_to_dataframe(
                 "growth_anom",
                 "decline_anom",
             ]
+        logger.info(f"DataFrame creado") 
         return pd.DataFrame(columns=cols)
 
     df_base = pd.DataFrame(
@@ -224,23 +286,25 @@ def waves_to_dataframe(
     if tiene_anomalias:
         # Desempaquetar la lista de diccionarios estadísticos en columnas del DataFrame
         df_anom = pd.DataFrame(anom_stats)
+        logger.info(f"DataFrame creado") 
         return pd.concat([df_base, df_anom], axis=1)
-
+    
+    logger.info(f"DataFrame creado") 
     return df_base
     
 
 
-def _procesar_pixel(serie: np.ndarray,
-                       min_dur: int = 5, 
+def _procesar_pixel(serie_da: np.ndarray,
+                       min_size_mhw: int = 5, 
                        max_gap: int = 2) -> np.ndarray:
     """Funcion interna detecta Olas de Calor Marinas (MHW) aplicando 
     el criterio de Hobday et al. (2016).
 
     Parámetros
     ----------
-    serie : xr.DataArray
+    serie_da: xr.DataArray
         Array booleano (o numérico) 1D (time). True/1 si supera el p90.
-    min_dur : int, opcional
+    min_size_mhw : int, opcional
         Duración mínima del evento en días. Por defecto 5.
     max_gap : int, opcional
         Brecha máxima de días consecutivos permitida por debajo del p90
@@ -254,43 +318,68 @@ def _procesar_pixel(serie: np.ndarray,
         - 0.0 = Océano sin MHW
         - NaN = Tierra firme
     """
-    size_t = serie.shape[0]
-    output = np.zeros(size_t, dtype=np.float32)
-    t = 0
+    serie_da = serie_da.copy()
 
-    while t <= size_t - min_dur:
-        # Condición de inicio: requiere 'min_dur' días consecutivos sobre el percentil
-        if serie[t] and np.all(serie[t : t + min_dur]):
-            t0 = t
-            t += min_dur
+    # si arranca una cadena de 1, change == 1
+    # si termina una cade de 1, change == -1
+    change_da = np.diff(serie_da.astype(int), prepend=0, append=0)
+    starts = np.where(change_da == 1)[0]   
+    ends = np.where(change_da == -1)[0]
 
-            # Extender el evento tolerando caídas breves (gaps cortos)
-            while t < size_t:
-                if not serie[t]:
-                    # Si los próximos días sin percentil superan el max_gap, se corta el evento
-                    if t + max_gap < size_t and not np.any(
-                        serie[t : t + max_gap + 1]
-                    ):
-                        break
-                t += 1
+    if len(starts) > 0:
+        size_posible_waves = starts.shape[0]
+        i = 1
+        new_starts = []
+        new_ends = []
 
-            output[t0:t] = 1.0
-        else:
-            t += 1
+        # calculo la duracion del primer evento
+        len_chain = ends[0] - starts[0]
+        while i < size_posible_waves - 1:
+            # calculo duracion del evento que sigue
+            len_next_chain = ends[i] - starts[i]
+            # si el evento actual es una mhw
+            if len_chain >= min_size_mhw:
+                len_gap = starts[i] - ends[i - 1]
+                # si el gap entre eventos es menor a lo esperado
+                # y el siguiente evento evento es una mhw
+                if len_gap <=max_gap and len_next_chain >= min_size_mhw:
+                    # transformo mi gap en mhw
+                    new_starts.append(starts[i - 1])
+                    new_ends.append(starts[i])
+                else:
+                    # mi mhw no cambia
+                    new_starts.append(starts[i - 1])
+                    new_ends.append(ends[i - 1])
+            # tomo el siguiente evento como punto de partida
+            len_chain = len_next_chain
+            # me paro donde inicia ese vento
+            i += 1
 
-    return output
+        # me fijo si el ultimo evento es o no mhw
+        if len_chain >= min_size_mhw:
+            new_starts.append(starts[i - 1])
+            new_ends.append(ends[i - 1])
+
+        # Crear máscara final
+        serie_final = np.zeros_like(serie_da , dtype=bool)
+        for start, end in zip(new_starts, new_ends):
+            serie_final[start:end] = True
+    else:
+        serie_final = np.zeros_like(serie_da , dtype=bool)
+    
+    return serie_final
 
 
 def get_marine_heat_waves(
-    is_sup_p90: xr.DataArray, min_dur: int = 5, max_gap: int = 2
+    posible_mhw_mask: xr.DataArray, min_size_mhw: int = 5, max_gap: int = 2
 ) -> xr.DataArray:
     """Detecta Olas de Calor Marinas (MHW) aplicando el criterio de Hobday et al. (2016).
 
     Parámetros
     ----------
-    is_sup_p90 : xr.DataArray
-        Array booleano (o numérico) 3D (time, lat, lon). True/1 si supera el p90.
-    min_dur : int, opcional
+    posible_mhw_mask: : xr.DataArray
+        Array booleano (o numérico) 3D (time, lat, lon). True/1 si supera un dado percentil.
+    min_size_mhw : int, opcional
         Duración mínima del evento en días. Por defecto 5.
     max_gap : int, opcional
         Brecha máxima de días consecutivos permitida por debajo del p90
@@ -304,30 +393,28 @@ def get_marine_heat_waves(
         - 0.0 = Océano sin MHW
         - NaN = Tierra firme
     """
-    # 1. Eliminar dimensiones pequenas (zlev, depth)
-    is_sup_p90 = np.squeeze(is_sup_p90)
-    
-    # 2. Identificar la máscara estática de tierra (donde todo el registro temporal sea NaN)
-    es_tierra = is_sup_p90.isnull().all(dim="time")
+    logger.info("Iniciando proceso")
+    # Tierra (donde todo el registro temporal sea NaN)
+    es_tierra = posible_mhw_mask.isnull().all(dim="time")
 
-    # 3. Limpiar NaNs temporales convirtiéndolos a 0 para el análisis numérico de la serie
-    data_bool = np.nan_to_num(is_sup_p90.values, nan=0).astype(bool)
-    size_t = data_bool.shape[0]
-
-    # 4. Aplicar la función _procesar_pixel a lo largo del eje del tiempo (axis=0) de manera eficiente
+    # Limpiar NaNs temporales convirtiéndolos a 0 para el análisis
+    data_bool = np.nan_to_num(posible_mhw_mask.values, nan=0).astype(bool)
+    logger.info("Procesando pixel por pixel (puede demorar algunos minutos)")
+    # Aplicar la función _procesar_pixel a lo largo del eje del tiempo (axis=0) de manera eficiente
     waves_np = np.apply_along_axis(_procesar_pixel, 
                                    axis=0, 
                                    arr=data_bool, 
-                                   min_dur=min_dur,
+                                   min_size_mhw=min_size_mhw,
                                    max_gap=max_gap)
 
-    # 5. Reconstruir el DataArray e inyectar correctamente la máscara de tierra original
+    # Reconstruir el DataArray e inyectar correctamente la máscara de tierra original
+    logger.info("Agregando dimensiones y coordenadas al DataArray")
     waves_da = xr.DataArray(
         waves_np, 
-        dims=is_sup_p90.dims, 
-        coords=is_sup_p90.coords,
+        dims=posible_mhw_mask.dims, 
+        coords=posible_mhw_mask.coords,
         name="waves"
     )
-
+    logger.info("DataArray tipo mascara de olas de calor creado")
     return waves_da.where(~es_tierra, np.nan)
 
